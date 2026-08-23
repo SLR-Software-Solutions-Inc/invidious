@@ -1,0 +1,306 @@
+name: Verify patch and publish image
+
+# Publishes a linux/amd64 image of this fork to GitHub's container registry —
+# but only ever from behind the patch guard.
+#
+# The gate is the reason this file exists. Our fork carries one fix: the
+# `extract_mix_video_ucid` guard in src/invidious/mixes.cr. Without it a single
+# multi-artist track collapses an entire mix into a 500; stations were failing
+# ~81% of the time. If that patch is ever lost, neutered, or refactored out from
+# under us by an upstream merge, an image built from that tree would reintroduce
+# the outage while looking perfectly healthy.
+#
+# So the ordering is load-bearing, not stylistic:
+#
+#     jobs.publish.needs: patch-guard
+#
+# `needs` makes `publish` unreachable unless `patch-guard` concluded success — a
+# failed or skipped guard skips publish entirely. The redundant
+# `needs.patch-guard.result == 'success'` on `publish` is deliberate belt-and-
+# braces: it keeps the gate shut even if someone later adds `if: always()`.
+#
+# "No image today" is an acceptable outcome. "An image whose patch silently
+# stopped working" is the single outcome this pipeline exists to prevent.
+#
+# HOW THIS IS REACHED: the sync workflow dispatches it on master after it lands
+# a merge. Chaining via `workflow_dispatch` rather than `workflow_run` is
+# deliberate — GitHub documents `workflow_dispatch` as one of the few events
+# that a GITHUB_TOKEN *is* allowed to raise, whereas `workflow_run`'s behaviour
+# behind a GITHUB_TOKEN push is not documented either way.
+
+on:
+  workflow_dispatch:
+  # On pull requests the guard runs but nothing is published (see publish's
+  # `if`). This keeps the patch covered on every change to it, and makes the
+  # gate observable before any of this is merged to master.
+  pull_request:
+    paths:
+      - "src/invidious/mixes.cr"
+      - "spec/invidious/mixes_spec.cr"
+      - "docker/Dockerfile"
+      - ".github/workflows/build-ghcr.yml"
+      - ".github/workflows/sync-upstream.yml"
+
+# The repository default for GITHUB_TOKEN is read-only; a workflow may request
+# more than the default, and these are the only scopes this one needs. No
+# repository secret and no personal credential is involved anywhere.
+permissions:
+  contents: read
+  packages: write # push to ghcr.io under this org
+  issues: write # shout when the guard trips
+
+concurrency:
+  group: build-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GUARD_LABEL: patch-guard-failed
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # THE GATE. Nothing is built, tagged or pushed until this job is green.
+  # ---------------------------------------------------------------------------
+  patch-guard:
+    name: Patch guard (spec must pass)
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
+      short_sha: ${{ steps.rev.outputs.short_sha }}
+      upstream_tag: ${{ steps.rev.outputs.upstream_tag }}
+      upstream_short: ${{ steps.rev.outputs.upstream_short }}
+      date: ${{ steps.rev.outputs.date }}
+
+    steps:
+      - name: Checkout the tree that would be shipped
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The spec exercises extract_mix_video_ucid directly, so on its own it
+      # cannot see the CALL SITE being deleted — the function could keep passing
+      # its spec while fetch_mix quietly reverts to the unguarded chain and the
+      # bug returns in full. Assert the wiring separately.
+      - name: Assert the guard is still wired into fetch_mix
+        run: |
+          fail=0
+          if ! grep -q 'def extract_mix_video_ucid' src/invidious/mixes.cr; then
+            echo "::error file=src/invidious/mixes.cr::extract_mix_video_ucid is no longer defined."
+            fail=1
+          fi
+          if ! grep -q 'ucid = extract_mix_video_ucid(item)' src/invidious/mixes.cr; then
+            echo "::error file=src/invidious/mixes.cr::fetch_mix no longer calls extract_mix_video_ucid — the guard exists but nothing uses it."
+            fail=1
+          fi
+          if grep -q '\["navigationEndpoint"\]\["browseEndpoint"\]\["browseId"\]' src/invidious/mixes.cr; then
+            echo "::error file=src/invidious/mixes.cr::the unguarded browseEndpoint chain is back in mixes.cr."
+            fail=1
+          fi
+          if [ ! -f spec/invidious/mixes_spec.cr ]; then
+            echo "::error::spec/invidious/mixes_spec.cr is missing — the guard has no coverage."
+            fail=1
+          fi
+          if [ "$fail" -eq 0 ]; then echo "Guard defined, call site wired, spec present."; fi
+          exit "$fail"
+
+      # Same container and same command as the check registered for this repo, so
+      # a green run here means what a green run on a laptop means. (Locally that
+      # must stay native arm64; this runner is Intel, so no --platform is needed
+      # or wanted in either place.)
+      - name: Run the mixes spec
+        run: |
+          docker run --rm --entrypoint sh -v "$PWD":/w -w /w \
+            84codes/crystal:1.20.3-alpine -c '
+              apk add --no-cache -q sqlite-static libxml2-dev yaml-dev zlib-dev openssl-dev >/dev/null 2>&1
+              shards install --skip-postinstall --skip-executables >/dev/null 2>&1
+              crystal spec spec/invidious/mixes_spec.cr
+            '
+
+      - name: Collect revision and upstream provenance
+        id: rev
+        run: |
+          git remote add upstream https://github.com/iv-org/invidious.git 2>/dev/null || true
+          git fetch --tags --quiet upstream master || true
+
+          upstream_tag=$(git describe --tags --abbrev=0 upstream/master 2>/dev/null \
+                          || git describe --tags --abbrev=0 2>/dev/null || echo "unknown")
+          upstream_short=$(git rev-parse --short upstream/master 2>/dev/null || echo "unknown")
+
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "short_sha=$(git rev-parse --short HEAD)"
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_short=$upstream_short"
+            echo "date=$(date -u +%Y.%m.%d)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Patch guard: PASSED"
+            echo
+            echo "\`spec/invidious/mixes_spec.cr\` is green and \`extract_mix_video_ucid\` is wired into \`fetch_mix\`."
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "This is a pull request, so publishing is skipped by design."
+            else
+              echo "Publishing is allowed for \`${{ steps.rev.outputs.short_sha }}\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue when the guard trips
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          body="The patch guard failed, so **no image was published**.
+
+          Our fork's fix in \`src/invidious/mixes.cr\` (\`extract_mix_video_ucid\`) is either gone,
+          neutered, or no longer wired into \`fetch_mix\` — most likely because an upstream merge
+          refactored that code path.
+
+          Until this is fixed the registry keeps serving the last known-good image, which is the
+          intended behaviour: a stale image is safe, an image with a dead guard is not.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          existing=$(gh issue list --state open --label "$GUARD_LABEL" --json number --jq '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh label create "$GUARD_LABEL" --description "Mixes patch guard failed" --color B60205 2>/dev/null || true
+            gh issue create --title "Patch guard failed — image publishing halted ($(date -u +%F))" \
+              --label "$GUARD_LABEL" --body "$body"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # PUBLISH. Unreachable unless the guard above concluded success.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Build and publish linux/amd64 to GHCR
+    needs: patch-guard # <-- THE GATE: a failed or skipped guard skips this job
+    if: >-
+      needs.patch-guard.result == 'success' &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.patch-guard.outputs.sha }}
+          # The Dockerfile copies .git in to derive its version string.
+          fetch-depth: 0
+
+      - name: Resolve lowercase image name
+        id: img
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/$owner/invidious" >> "$GITHUB_OUTPUT"
+          echo "repo=$owner/invidious" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The workflow's own automatic token. No PAT, no repository secret.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            release=1
+          # Tags carry the provenance a human needs to answer "which upstream is
+          # this?" without opening the registry:
+          #   master                               rolling latest
+          #   upstream-<tag>-<upstream short sha>  which upstream it came from
+          #   <date>-<our short sha>               unique and immutable per build
+          tags: |
+            ${{ steps.img.outputs.image }}:master
+            ${{ steps.img.outputs.image }}:upstream-${{ needs.patch-guard.outputs.upstream_tag }}-${{ needs.patch-guard.outputs.upstream_short }}
+            ${{ steps.img.outputs.image }}:${{ needs.patch-guard.outputs.date }}-${{ needs.patch-guard.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.patch-guard.outputs.sha }}
+            org.opencontainers.image.version=upstream-${{ needs.patch-guard.outputs.upstream_tag }}
+            org.opencontainers.image.description=Invidious (SLR fork) — upstream ${{ needs.patch-guard.outputs.upstream_tag }} @ ${{ needs.patch-guard.outputs.upstream_short }}, plus the mixes browseEndpoint guard
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Surface the digest before anything else can fail, so it is always
+      # recoverable from the run summary for pinning.
+      - name: Record digest
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| platform | \`linux/amd64\` |"
+            echo "| upstream | \`${{ needs.patch-guard.outputs.upstream_tag }}\` @ \`${{ needs.patch-guard.outputs.upstream_short }}\` |"
+            echo "| our commit | \`${{ needs.patch-guard.outputs.short_sha }}\` |"
+            echo
+            echo "**Pin this digest:**"
+            echo
+            echo '```'
+            echo "${{ steps.img.outputs.image }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo
+            echo "Tags: \`master\`, \`upstream-${{ needs.patch-guard.outputs.upstream_tag }}-${{ needs.patch-guard.outputs.upstream_short }}\`, \`${{ needs.patch-guard.outputs.date }}-${{ needs.patch-guard.outputs.short_sha }}\`"
+            echo
+            echo "_Publishing ends here by design — no manifest, cluster or ArgoCD state is touched. Rollout stays an explicit, human action._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Proof, not assumption.
+      #
+      # GitHub documents that "when you first publish a package, the default
+      # visibility is private", and that a linked repository passes on its access
+      # permissions "but not the visibility". There is no REST endpoint to change
+      # container visibility and the automatic GITHUB_TOKEN cannot do it — it is a
+      # one-time switch in the package's own settings page. Rather than assume
+      # somebody flipped it, prove it every run: fetch an anonymous registry token
+      # with no credentials of any kind and pull the manifest by digest.
+      #
+      # Expect this to be the one red step on the very first publish, until the
+      # package is made public once. It fails loudly rather than shipping an image
+      # nobody outside the org can actually pull.
+      - name: Prove the image is pullable without credentials
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          REPO: ${{ steps.img.outputs.repo }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # An anonymous token: no Authorization header is sent to obtain it.
+          token=$(curl -sSL "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" \
+                    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                   -H "Authorization: Bearer ${token}" \
+                   -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.manifest.v1+json" \
+                   "https://ghcr.io/v2/${REPO}/manifests/${DIGEST}")
+
+          if [ "$code" = "200" ]; then
+            echo "Unauthenticated manifest fetch returned 200 — the image is PUBLIC."
+            echo "| visibility | public (verified by an unauthenticated manifest fetch) |" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error::Anonymous pull of ${IMAGE}@${DIGEST} returned HTTP ${code} — the package is NOT public."
+          {
+            echo
+            echo "> **The image was pushed but is not publicly pullable (HTTP ${code}).**"
+            echo "> GHCR makes a new package private on first publish, and neither the REST API nor"
+            echo "> the automatic token can change that. One-time fix by an org owner:"
+            echo "> ${{ github.server_url }}/orgs/${{ github.repository_owner }}/packages/container/invidious/settings"
+            echo "> → Danger Zone → Change visibility → Public. Re-run this workflow to confirm."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

@@ -1,0 +1,352 @@
+name: Sync fork with upstream
+
+# Pulls iv-org/invidious master into this fork's master once a day, keeping our
+# local patch on top of it.
+#
+# The failure modes are the whole point of this file, so they are spelled out:
+#
+#   * MERGE, never rebase. Rebasing our patch onto upstream would require
+#     `push --force`, and a force-push is the single operation that can silently
+#     discard a commit. A merge can only ever add commits, never lose one.
+#
+#   * A merge that CONFLICTS is aborted, not resolved. `git merge --abort`
+#     restores the tree byte-for-byte, an issue is opened, and the job fails.
+#     master is never left mid-merge and never receives a half-resolved tree.
+#
+#   * A merge that SUCCEEDS but no longer carries our patch is also refused.
+#     "Merged cleanly" does not mean "our fix survived": upstream can rewrite
+#     fetch_mix in a way that merges without any conflict and quietly drops our
+#     call site. That is checked here, before anything is pushed.
+#
+# The push uses the automatic GITHUB_TOKEN. GitHub documents that "events
+# triggered by the GITHUB_TOKEN will not create a new workflow run" — so this
+# push does NOT start `push`-triggered workflows. That is deliberate twice over:
+# it keeps the inherited quay.io workflow (build-nightly-container.yml, which is
+# `on: push:` to master and needs QUAY_* secrets this fork does not have) from
+# ever firing, and it means the image build has to be asked for explicitly.
+#
+# `workflow_dispatch` is one of the documented exceptions to that rule, so the
+# last step here dispatches the build workflow directly. That is why the chain
+# is a dispatch and not a `workflow_run` trigger: the dispatch exception is
+# documented, `workflow_run`'s behaviour behind a GITHUB_TOKEN push is not.
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily, 04:17 UTC
+  workflow_dispatch:
+
+# The repository default for GITHUB_TOKEN is read-only; these are the two
+# scopes this workflow actually needs, and nothing else is granted.
+permissions:
+  contents: write # push the merge commit to master
+  issues: write # open an issue when the merge cannot be taken
+  actions: write # dispatch the build workflow once the merge has landed
+
+# Never let two syncs race for master.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/iv-org/invidious.git
+  UPSTREAM_BRANCH: master
+  CONFLICT_LABEL: upstream-sync-blocked
+
+jobs:
+  sync:
+    name: Merge upstream into master
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout master with full history
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          # Full history: a shallow clone cannot compute a merge base against
+          # upstream, and the Dockerfile derives the version string from .git.
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure committer
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || \
+            git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git fetch --tags upstream || true
+
+      - name: Record pre-merge state
+        id: pre
+        run: |
+          {
+            echo "base_sha=$(git rev-parse HEAD)"
+            echo "upstream_sha=$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check whether there is anything to take
+        id: ahead
+        run: |
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "Already contains upstream/$UPSTREAM_BRANCH — nothing to merge."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream commits to take:"
+            git log --oneline HEAD.."upstream/$UPSTREAM_BRANCH" | head -50
+          fi
+
+      - name: Merge upstream (abort on conflict)
+        id: merge
+        if: steps.ahead.outputs.changed == 'true'
+        run: |
+          set +e
+          git merge --no-edit --no-ff "upstream/$UPSTREAM_BRANCH"
+          status=$?
+          set -e
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Merge of upstream/$UPSTREAM_BRANCH conflicts. Aborting; master is untouched."
+            echo "conflicts<<EOF" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U >> "$GITHUB_OUTPUT" || true
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            git merge --abort || git reset --hard "${{ steps.pre.outputs.base_sha }}"
+            echo "failed=conflict" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          echo "failed=" >> "$GITHUB_OUTPUT"
+          echo "Merged cleanly: $(git rev-parse --short HEAD)"
+
+      # A clean merge is not proof the patch survived. Verify BOTH halves of it
+      # are still in the tree before any of this reaches master: the guard
+      # function itself, its call site inside fetch_mix, and the spec that
+      # covers it. If upstream refactored any of these away, the merge is thrown
+      # out and a human is asked to reconcile it.
+      - name: Verify our patch survived the merge
+        id: integrity
+        if: steps.ahead.outputs.changed == 'true'
+        run: |
+          missing=""
+          [ -f spec/invidious/mixes_spec.cr ] || missing="$missing\n  - spec/invidious/mixes_spec.cr is gone"
+          grep -q 'def extract_mix_video_ucid' src/invidious/mixes.cr \
+            || missing="$missing\n  - src/invidious/mixes.cr no longer defines extract_mix_video_ucid"
+          grep -q 'ucid = extract_mix_video_ucid(item)' src/invidious/mixes.cr \
+            || missing="$missing\n  - fetch_mix no longer calls extract_mix_video_ucid (call site lost)"
+
+          if [ -n "$missing" ]; then
+            echo "::error::Upstream merged cleanly but our patch did not survive it."
+            printf "%b\n" "$missing"
+            {
+              echo "integrity<<EOF"
+              printf "%b\n" "$missing"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git reset --hard "${{ steps.pre.outputs.base_sha }}"
+            exit 1
+          fi
+          echo "Patch intact: guard defined, call site wired, spec present."
+
+      - name: Push merge to master
+        if: steps.ahead.outputs.changed == 'true'
+        run: |
+          git push origin HEAD:master
+          echo "Pushed $(git rev-parse --short HEAD) to master."
+
+      # Only when master actually moved. An unchanged tree would rebuild to the
+      # same content, and the guard has nothing new to check.
+      - name: Ask the build workflow to verify and publish
+        if: steps.ahead.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build-ghcr.yml --ref master
+          echo "Dispatched build-ghcr.yml on master."
+
+      # THIRD CHECK — obsolescence, not breakage.
+      #
+      # The integrity check above catches our patch being LOST. This catches it
+      # becoming UNNECESSARY. If upstream fixes the same bug their own way — a
+      # guard in the caller, a restructured fetch_mix, a different parser — the
+      # merge is clean, our spec still passes, and we would carry a redundant
+      # patch forever without anyone noticing. A fork should carry a patch only
+      # while it is needed and then go back to being a plain mirror.
+      #
+      # The signal is deliberately narrow: upstream's OWN mixes.cr no longer
+      # contains the unguarded browseEndpoint chain that caused the outage.
+      # Today it still does, so this stays quiet.
+      #
+      # This is a NOTIFICATION, never a failure. Upstream fixing the bug is good
+      # news. `continue-on-error` means nothing in here — a git error, a gh
+      # outage, a bad grep — can fail the sync or hold up the build, which has
+      # already been dispatched by the time this runs.
+      #
+      # It is also a HEURISTIC, and the issue says so in its own body. Acting on
+      # a false positive would delete the guard and reintroduce the exact bug
+      # that had stations failing ~81% of the time, so the issue is worded as
+      # "check this", never "safe to remove".
+      - name: Notice if upstream has fixed this themselves
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHAIN='["navigationEndpoint"]["browseEndpoint"]["browseId"]'
+          LABEL=patch-possibly-obsolete
+
+          up=$(git show "upstream/$UPSTREAM_BRANCH:src/invidious/mixes.cr" 2>/dev/null || true)
+          if [ -z "$up" ]; then
+            echo "Could not read upstream's src/invidious/mixes.cr — saying nothing."
+            exit 0
+          fi
+
+          if printf '%s\n' "$up" | grep -qF -- "$CHAIN"; then
+            echo "Upstream still reads browseEndpoint unguarded. Our patch is still needed."
+            exit 0
+          fi
+
+          echo "Upstream's mixes.cr no longer contains the unguarded chain — worth a look."
+
+          existing=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            echo "Issue #$existing is already open — not opening another."
+            exit 0
+          fi
+
+          # The commit that last changed how many times that chain appears in
+          # upstream's file is our best guess at the one that removed it.
+          sha=$(git log -1 --format=%H  -S"$CHAIN" "upstream/$UPSTREAM_BRANCH" -- src/invidious/mixes.cr 2>/dev/null || true)
+          subj=$(git log -1 --format=%s -S"$CHAIN" "upstream/$UPSTREAM_BRANCH" -- src/invidious/mixes.cr 2>/dev/null || true)
+          when=$(git log -1 --format=%ad --date=short -S"$CHAIN" "upstream/$UPSTREAM_BRANCH" -- src/invidious/mixes.cr 2>/dev/null || true)
+          [ -n "$sha" ] || { sha="unknown"; subj="(could not identify the commit)"; when="?"; }
+
+          if printf '%s\n' "$up" | grep -q 'browseEndpoint'; then
+            mentions="yes — but not through the old unguarded chain"
+          else
+            mentions="no — upstream's mixes.cr does not mention browseEndpoint at all any more"
+          fi
+
+          excerpt=$(printf '%s\n' "$up" | grep -nE 'ucid|browseEndpoint|longBylineText' | head -20 || true)
+
+          {
+            echo "The daily sync noticed something worth a human's attention: **upstream may have fixed this bug themselves**, which would make our patch redundant."
+            echo
+            echo "This is a heuristic, not a verdict. **Do not delete anything on the strength of this issue alone.**"
+            echo
+            echo "### What it matched on"
+            echo
+            echo "The unguarded chain our fix exists to replace:"
+            echo
+            echo '```crystal'
+            echo "$CHAIN"
+            echo '```'
+            echo
+            echo "no longer appears anywhere in \`upstream/$UPSTREAM_BRANCH:src/invidious/mixes.cr\`. That is the entire signal — it is a string match, nothing more. It fires whether upstream guarded the lookup, moved it, or rewrote that code path for unrelated reasons."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Upstream commit that appears to have removed it | [\`$sha\`](https://github.com/iv-org/invidious/commit/$sha) |"
+            echo "| Subject | $subj |"
+            echo "| Date | $when |"
+            echo "| Still mentions \`browseEndpoint\`? | $mentions |"
+            echo
+            if [ -n "$excerpt" ]; then
+              echo "Upstream's current lines around this code path:"
+              echo
+              echo '```'
+              echo "$excerpt"
+              echo '```'
+              echo
+            fi
+            echo "### Before retiring our patch"
+            echo
+            echo "Confirm by hand that upstream genuinely handles a **missing \`browseEndpoint\`** — the multi-artist byline that sends a \`showDialogCommand\` instead of a channel link. A rename, a refactor, or a move to another file all trip this same check without fixing anything."
+            echo
+            echo "If upstream really has fixed it, retiring our patch means reverting \`src/invidious/mixes.cr\` to upstream's version and deleting \`spec/invidious/mixes_spec.cr\` — at which point the patch guard in \`build-ghcr.yml\` must come out too, or every build will fail on a guard that is deliberately gone."
+            echo
+            echo "If it has not, close this issue. It will not reopen while it is open, and the check will keep quiet until the string reappears and disappears again."
+            echo
+            echo "Sync run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/obsolete.md
+
+          gh label create "$LABEL" \
+            --description "Upstream may have fixed the mixes bug; our patch may be redundant" \
+            --color 0E8A16 2>/dev/null || true
+
+          gh issue create \
+            --title "Our mixes patch may be obsolete — upstream appears to have fixed it" \
+            --label "$LABEL" \
+            --body-file /tmp/obsolete.md
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Upstream sync"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| upstream | \`${{ steps.pre.outputs.upstream_sha }}\` |"
+            echo "| master before | \`${{ steps.pre.outputs.base_sha }}\` |"
+            echo "| master after | \`$(git rev-parse HEAD)\` |"
+            echo "| had changes | ${{ steps.ahead.outputs.changed }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One open issue at a time, not one per day. Covers both refusal paths:
+      # a conflicting merge, and a clean merge that lost the patch.
+      - name: Open an issue when the sync is blocked
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing=$(gh issue list --state open --label "$CONFLICT_LABEL" \
+                       --json number --jq '.[0].number' || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body \
+              "Sync still blocked as of $(date -u +%FT%TZ). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            exit 0
+          fi
+
+          gh label create "$CONFLICT_LABEL" \
+            --description "Upstream sync could not be taken automatically" \
+            --color B60205 2>/dev/null || true
+
+          {
+            echo "The daily sync from \`iv-org/invidious\` could not be applied, so **master was left untouched**."
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| upstream | \`${{ steps.pre.outputs.upstream_sha }}\` |"
+            echo "| our master | \`${{ steps.pre.outputs.base_sha }}\` |"
+            echo
+            if [ -n "${{ steps.merge.outputs.conflicts }}" ]; then
+              echo "**The merge conflicted.** Files needing a human:"
+              echo '```'
+              echo "${{ steps.merge.outputs.conflicts }}"
+              echo '```'
+            fi
+            if [ -n "${{ steps.integrity.outputs.integrity }}" ]; then
+              echo "**Upstream merged cleanly, but our patch did not survive it:**"
+              echo '```'
+              echo "${{ steps.integrity.outputs.integrity }}"
+              echo '```'
+              echo "Upstream has most likely refactored \`fetch_mix\`. Re-apply the guard against the new shape, keep \`spec/invidious/mixes_spec.cr\` passing, then re-run this workflow."
+            fi
+            echo
+            echo "Nothing was force-pushed and no commit was dropped. Resolve locally:"
+            echo
+            echo '```bash'
+            echo "git fetch origin master && git checkout master"
+            echo "git remote add upstream $UPSTREAM_REPO 2>/dev/null || true"
+            echo "git fetch upstream master && git merge upstream/master"
+            echo '```'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/issue-body.md
+
+          gh issue create \
+            --title "Upstream sync blocked ($(date -u +%F))" \
+            --label "$CONFLICT_LABEL" \
+            --body-file /tmp/issue-body.md
