@@ -18,6 +18,24 @@ struct Mix
   property videos : Array(MixVideo)
 end
 
+# Channel id for a mix entry's author, or "" when YouTube does not give one.
+#
+# `longBylineText` normally carries a `browseEndpoint` holding the channel id,
+# but when a track credits more than one artist ("A and B") YouTube replaces it
+# with a `showDialogCommand` that opens a picker instead. Reading `browseEndpoint`
+# unconditionally raised `KeyError` there, and because the caller in
+# `routes/api/v1/misc.cr` turns any exception into a 500, a single such entry
+# discarded the whole mix — every other track included.
+#
+# Which entries YouTube returns varies between calls, so the same mix id would
+# succeed and fail minute to minute. Degrading to a blank ucid costs that one
+# entry its channel link; the mix, and every other track's title, id, author and
+# length, survive.
+def extract_mix_video_ucid(item : JSON::Any) : String
+  item.dig?("longBylineText", "runs", 0, "navigationEndpoint", "browseEndpoint", "browseId")
+    .try(&.as_s?) || ""
+end
+
 def fetch_mix(rdid, video_id, cookies = nil, locale = nil)
   headers = HTTP::Headers.new
 
@@ -52,7 +70,7 @@ def fetch_mix(rdid, video_id, cookies = nil, locale = nil)
     next if !title
 
     author = item["longBylineText"]["runs"][0]["text"].as_s
-    ucid = item["longBylineText"]["runs"][0]["navigationEndpoint"]["browseEndpoint"]["browseId"].as_s
+    ucid = extract_mix_video_ucid(item)
     length_seconds = decode_length_seconds(item["lengthText"]["simpleText"].as_s)
     index = item["navigationEndpoint"]["watchEndpoint"]["index"].as_i
 
