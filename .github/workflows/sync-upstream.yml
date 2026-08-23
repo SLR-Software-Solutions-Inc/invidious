@@ -166,6 +166,120 @@ jobs:
           gh workflow run build-ghcr.yml --ref master
           echo "Dispatched build-ghcr.yml on master."
 
+      # THIRD CHECK — obsolescence, not breakage.
+      #
+      # The integrity check above catches our patch being LOST. This catches it
+      # becoming UNNECESSARY. If upstream fixes the same bug their own way — a
+      # guard in the caller, a restructured fetch_mix, a different parser — the
+      # merge is clean, our spec still passes, and we would carry a redundant
+      # patch forever without anyone noticing. A fork should carry a patch only
+      # while it is needed and then go back to being a plain mirror.
+      #
+      # The signal is deliberately narrow: upstream's OWN mixes.cr no longer
+      # contains the unguarded browseEndpoint chain that caused the outage.
+      # Today it still does, so this stays quiet.
+      #
+      # This is a NOTIFICATION, never a failure. Upstream fixing the bug is good
+      # news. `continue-on-error` means nothing in here — a git error, a gh
+      # outage, a bad grep — can fail the sync or hold up the build, which has
+      # already been dispatched by the time this runs.
+      #
+      # It is also a HEURISTIC, and the issue says so in its own body. Acting on
+      # a false positive would delete the guard and reintroduce the exact bug
+      # that had stations failing ~81% of the time, so the issue is worded as
+      # "check this", never "safe to remove".
+      - name: Notice if upstream has fixed this themselves
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHAIN='["navigationEndpoint"]["browseEndpoint"]["browseId"]'
+          LABEL=patch-possibly-obsolete
+
+          up=$(git show "upstream/$UPSTREAM_BRANCH:src/invidious/mixes.cr" 2>/dev/null || true)
+          if [ -z "$up" ]; then
+            echo "Could not read upstream's src/invidious/mixes.cr — saying nothing."
+            exit 0
+          fi
+
+          if printf '%s\n' "$up" | grep -qF -- "$CHAIN"; then
+            echo "Upstream still reads browseEndpoint unguarded. Our patch is still needed."
+            exit 0
+          fi
+
+          echo "Upstream's mixes.cr no longer contains the unguarded chain — worth a look."
+
+          existing=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            echo "Issue #$existing is already open — not opening another."
+            exit 0
+          fi
+
+          # The commit that last changed how many times that chain appears in
+          # upstream's file is our best guess at the one that removed it.
+          sha=$(git log -1 --format=%H  -S"$CHAIN" "upstream/$UPSTREAM_BRANCH" -- src/invidious/mixes.cr 2>/dev/null || true)
+          subj=$(git log -1 --format=%s -S"$CHAIN" "upstream/$UPSTREAM_BRANCH" -- src/invidious/mixes.cr 2>/dev/null || true)
+          when=$(git log -1 --format=%ad --date=short -S"$CHAIN" "upstream/$UPSTREAM_BRANCH" -- src/invidious/mixes.cr 2>/dev/null || true)
+          [ -n "$sha" ] || { sha="unknown"; subj="(could not identify the commit)"; when="?"; }
+
+          if printf '%s\n' "$up" | grep -q 'browseEndpoint'; then
+            mentions="yes — but not through the old unguarded chain"
+          else
+            mentions="no — upstream's mixes.cr does not mention browseEndpoint at all any more"
+          fi
+
+          excerpt=$(printf '%s\n' "$up" | grep -nE 'ucid|browseEndpoint|longBylineText' | head -20 || true)
+
+          {
+            echo "The daily sync noticed something worth a human's attention: **upstream may have fixed this bug themselves**, which would make our patch redundant."
+            echo
+            echo "This is a heuristic, not a verdict. **Do not delete anything on the strength of this issue alone.**"
+            echo
+            echo "### What it matched on"
+            echo
+            echo "The unguarded chain our fix exists to replace:"
+            echo
+            echo '```crystal'
+            echo "$CHAIN"
+            echo '```'
+            echo
+            echo "no longer appears anywhere in \`upstream/$UPSTREAM_BRANCH:src/invidious/mixes.cr\`. That is the entire signal — it is a string match, nothing more. It fires whether upstream guarded the lookup, moved it, or rewrote that code path for unrelated reasons."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Upstream commit that appears to have removed it | [\`$sha\`](https://github.com/iv-org/invidious/commit/$sha) |"
+            echo "| Subject | $subj |"
+            echo "| Date | $when |"
+            echo "| Still mentions \`browseEndpoint\`? | $mentions |"
+            echo
+            if [ -n "$excerpt" ]; then
+              echo "Upstream's current lines around this code path:"
+              echo
+              echo '```'
+              echo "$excerpt"
+              echo '```'
+              echo
+            fi
+            echo "### Before retiring our patch"
+            echo
+            echo "Confirm by hand that upstream genuinely handles a **missing \`browseEndpoint\`** — the multi-artist byline that sends a \`showDialogCommand\` instead of a channel link. A rename, a refactor, or a move to another file all trip this same check without fixing anything."
+            echo
+            echo "If upstream really has fixed it, retiring our patch means reverting \`src/invidious/mixes.cr\` to upstream's version and deleting \`spec/invidious/mixes_spec.cr\` — at which point the patch guard in \`build-ghcr.yml\` must come out too, or every build will fail on a guard that is deliberately gone."
+            echo
+            echo "If it has not, close this issue. It will not reopen while it is open, and the check will keep quiet until the string reappears and disappears again."
+            echo
+            echo "Sync run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/obsolete.md
+
+          gh label create "$LABEL" \
+            --description "Upstream may have fixed the mixes bug; our patch may be redundant" \
+            --color 0E8A16 2>/dev/null || true
+
+          gh issue create \
+            --title "Our mixes patch may be obsolete — upstream appears to have fixed it" \
+            --label "$LABEL" \
+            --body-file /tmp/obsolete.md
+
       - name: Summary
         if: always()
         run: |
