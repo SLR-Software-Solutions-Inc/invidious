@@ -146,10 +146,24 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Open an issue when the guard trips
+      # The guard tripping is the single most important thing this repo can say,
+      # so it is said in the job summary and as an ::error:: annotation FIRST —
+      # neither needs an API call, a token, or Issues to be enabled — and only
+      # then in an issue.
+      #
+      # The issue is created WITHOUT --label. `gh issue create --label X` fails
+      # outright when X does not exist, which means a missing label silently
+      # costs you the whole report; the sync workflow lost a blocked-sync report
+      # to exactly that on 2026-08-25. The label is applied afterwards and its
+      # failure is a warning, never a reason for the alarm not to sound.
+      - name: Report when the guard trips
         if: failure() && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
+          TITLE_PREFIX: "Patch guard failed — image publishing halted"
         run: |
           body="The patch guard failed, so **no image was published**.
 
@@ -162,14 +176,36 @@ jobs:
 
           Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          existing=$(gh issue list --state open --label "$GUARD_LABEL" --json number --jq '.[0].number' || true)
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
-          else
-            gh label create "$GUARD_LABEL" --description "Mixes patch guard failed" --color B60205 2>/dev/null || true
-            gh issue create --title "Patch guard failed — image publishing halted ($(date -u +%F))" \
-              --label "$GUARD_LABEL" --body "$body"
+          # ALWAYS. Cannot fail: no API, no token, no repository feature.
+          {
+            echo "### Patch guard: FAILED — nothing published"
+            echo
+            echo "$body"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Patch guard failed — no image was published. Full report in this run's job summary."
+
+          # BEST EFFORT from here down. Nothing below may mask the above.
+          gh label create "$GUARD_LABEL" --description "Mixes patch guard failed" --color B60205 >/dev/null 2>&1 || true
+
+          existing=$(gh issue list --state open --label "$GUARD_LABEL" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$existing" ]; then
+            existing=$(gh issue list --state open --search "$TITLE_PREFIX in:title" --json number,title \
+                         --jq "[.[] | select(.title | startswith(\"$TITLE_PREFIX\"))] | .[0].number" 2>/dev/null || true)
           fi
+
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --body "$body" \
+              || echo "::warning::Could not comment on #$existing — the report is in the job summary."
+            exit 0
+          fi
+
+          url=$(gh issue create --title "$TITLE_PREFIX ($(date -u +%F))" --body "$body") || {
+            echo "::warning::Could not open an issue (are Issues enabled on this repo?) — the full report is in the job summary above."
+            exit 0
+          }
+          echo "Opened $url"
+          gh issue edit "$url" --add-label "$GUARD_LABEL" \
+            || echo "::warning::Opened $url but could not apply the '$GUARD_LABEL' label."
 
   # ---------------------------------------------------------------------------
   # PUBLISH. Unreachable unless the guard above concluded success.

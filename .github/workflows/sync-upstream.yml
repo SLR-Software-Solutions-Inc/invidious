@@ -12,11 +12,16 @@ name: Sync fork with upstream
 #   * A merge that CONFLICTS is aborted, not resolved. `git merge --abort`
 #     restores the tree byte-for-byte, an issue is opened, and the job fails.
 #     master is never left mid-merge and never receives a half-resolved tree.
+#     The one carve-out is `.github/workflows/`, which is ours by policy — see
+#     "Quarantine upstream's workflow changes" below.
 #
 #   * A merge that SUCCEEDS but no longer carries our patch is also refused.
 #     "Merged cleanly" does not mean "our fix survived": upstream can rewrite
 #     fetch_mix in a way that merges without any conflict and quietly drops our
 #     call site. That is checked here, before anything is pushed.
+#
+#   * UPSTREAM'S CI IS NOT TAKEN. `.github/workflows/` is reset to our version
+#     on every merge. See the quarantine step for why this is not optional.
 #
 # The push uses the automatic GITHUB_TOKEN. GitHub documents that "events
 # triggered by the GITHUB_TOKEN will not create a new workflow run" — so this
@@ -35,8 +40,17 @@ on:
     - cron: "17 4 * * *" # daily, 04:17 UTC
   workflow_dispatch:
 
-# The repository default for GITHUB_TOKEN is read-only; these are the two
+# The repository default for GITHUB_TOKEN is read-only; these are the three
 # scopes this workflow actually needs, and nothing else is granted.
+#
+# There is deliberately no `workflows` scope here, and there could not be: the
+# `permissions:` block has no such key. GitHub's documented GITHUB_TOKEN scopes
+# are actions, artifact-metadata, attestations, checks, code-quality, contents,
+# deployments, id-token, issues, discussions, packages, pages, pull-requests,
+# security-events, statuses and vulnerability-alerts. `workflow` is a
+# PAT/GitHub-App scope only, so no value of this block — `write-all` included —
+# lets GITHUB_TOKEN write a file under .github/workflows/. That is why upstream's
+# CI is quarantined rather than merged; see that step for the full reasoning.
 permissions:
   contents: write # push the merge commit to master
   issues: write # open an issue when the merge cannot be taken
@@ -51,6 +65,8 @@ env:
   UPSTREAM_REPO: https://github.com/iv-org/invidious.git
   UPSTREAM_BRANCH: master
   CONFLICT_LABEL: upstream-sync-blocked
+  # Ours by policy. Nothing upstream writes here ever reaches master.
+  PROTECTED_PATH: .github/workflows
 
 jobs:
   sync:
@@ -102,6 +118,8 @@ jobs:
       - name: Merge upstream (abort on conflict)
         id: merge
         if: steps.ahead.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.pre.outputs.base_sha }}
         run: |
           set +e
           git merge --no-edit --no-ff "upstream/$UPSTREAM_BRANCH"
@@ -109,17 +127,137 @@ jobs:
           set -e
 
           if [ "$status" -ne 0 ]; then
-            echo "::error::Merge of upstream/$UPSTREAM_BRANCH conflicts. Aborting; master is untouched."
-            echo "conflicts<<EOF" >> "$GITHUB_OUTPUT"
-            git diff --name-only --diff-filter=U >> "$GITHUB_OUTPUT" || true
-            echo "EOF" >> "$GITHUB_OUTPUT"
-            git merge --abort || git reset --hard "${{ steps.pre.outputs.base_sha }}"
-            echo "failed=conflict" >> "$GITHUB_OUTPUT"
-            exit 1
+            conflicted=$(git diff --name-only --diff-filter=U)
+
+            # Split the conflicted paths into "ours by policy" and "real".
+            # Exact prefix match, not a regex — a path is either inside
+            # .github/workflows/ or it is not.
+            outside=""
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              case "$f" in
+                "$PROTECTED_PATH"/*) ;;
+                *) outside="${outside}${f}"$'\n' ;;
+              esac
+            done <<< "$conflicted"
+
+            if [ -n "$outside" ]; then
+              # A REAL conflict. Unchanged behaviour: abort, report, leave
+              # master byte-for-byte as it was.
+              echo "::error::Merge of upstream/$UPSTREAM_BRANCH conflicts. Aborting; master is untouched."
+              {
+                echo "conflicts<<EOF"
+                printf '%s' "$outside"
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              git merge --abort || git reset --hard "$BASE_SHA"
+              echo "failed=conflict" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            # Conflict confined to .github/workflows/. That is not a conflict we
+            # have any opinion about — that path is ours, upstream's side of it
+            # is discarded either way. Resolve to our side and let the merge
+            # complete so the real code still lands.
+            echo "::notice::Conflict confined to $PROTECTED_PATH/ — taking our side (policy) and continuing."
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if git cat-file -e "$BASE_SHA:$f" 2>/dev/null; then
+                git checkout "$BASE_SHA" -- "$f"
+                git add -- "$f"
+              else
+                git rm -q -f -- "$f"
+              fi
+            done <<< "$conflicted"
+            git commit --no-edit
           fi
 
           echo "failed=" >> "$GITHUB_OUTPUT"
           echo "Merged cleanly: $(git rev-parse --short HEAD)"
+
+      # `.github/workflows/` IS OURS. Every path under it is reset to exactly
+      # what master had before the merge, and the merge commit is amended.
+      #
+      # Why this exists rather than a `workflows: write` permission: there is no
+      # such permission to grant. The `permissions:` block has no `workflows`
+      # key — `workflow` is a PAT / GitHub-App scope, not a GITHUB_TOKEN one —
+      # so the only way to let this job push upstream's CI would be to hold a
+      # personal access token in a repository secret and push with that. That
+      # trades a scheduled, unattended job that merges third-party commits into
+      # a job holding a credential that can rewrite any workflow in this repo,
+      # including the patch guard in build-ghcr.yml that is the only thing
+      # standing between a dead patch and a published image. Not worth it to
+      # import CI we do not run.
+      #
+      # And we do not run it. Of upstream's six workflows, build-nightly-container
+      # and auto-close-duplicate are disabled here, ci.yml and stale.yml are
+      # fork-disabled, and build-stable-container/create-release publish to
+      # quay.io with QUAY_* secrets this fork does not have. Our CI is
+      # build-ghcr.yml and this file, neither of which exists upstream — so a
+      # merge cannot touch them, today or ever.
+      #
+      # The merge commit still records upstream's commit as a parent, so a
+      # quarantined change is never offered again, and "merge, never rebase"
+      # is untouched: nothing is dropped from history, only from the tree.
+      #
+      # An upstream workflow change worth having is ported by hand. The paths
+      # are listed in the job summary of every run that quarantines one.
+      - name: Quarantine upstream's workflow changes
+        id: quarantine
+        if: steps.ahead.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.pre.outputs.base_sha }}
+        run: |
+          touched=$(git diff --name-only "$BASE_SHA" HEAD -- "$PROTECTED_PATH" || true)
+
+          if [ -z "$touched" ]; then
+            echo "Upstream changed nothing under $PROTECTED_PATH/."
+            echo "quarantined=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream touched $PROTECTED_PATH/ — restoring our versions:"
+            printf '%s\n' "$touched" | sed 's/^/  - /'
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if git cat-file -e "$BASE_SHA:$f" 2>/dev/null; then
+                # Upstream modified (or deleted) a file we have: ours wins.
+                git checkout "$BASE_SHA" -- "$f"
+              else
+                # Upstream ADDED a workflow we have never had. A new workflow
+                # file is executable code that would run in this repo, so it is
+                # the one case that must not land by default. Not taken.
+                git rm -q -f --ignore-unmatch -- "$f"
+              fi
+            done <<< "$touched"
+            git commit --amend --no-edit
+            {
+              echo "quarantined<<EOF"
+              printf '%s\n' "$touched"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+          # Assert, do not assume. If one byte under .github/workflows/ still
+          # differs from our pre-merge master, the push is going to be rejected
+          # exactly as it was on 2026-08-25 — so stop here instead, with master
+          # untouched and a report, rather than at the remote.
+          if ! git diff --quiet "$BASE_SHA" HEAD -- "$PROTECTED_PATH"; then
+            echo "::error::Quarantine failed — $PROTECTED_PATH/ still differs from master. Refusing to push."
+            git diff --name-status "$BASE_SHA" HEAD -- "$PROTECTED_PATH"
+            git reset --hard "$BASE_SHA"
+            exit 1
+          fi
+          echo "$PROTECTED_PATH/ is byte-for-byte our pre-merge master."
+
+          # Did anything OTHER than upstream's CI actually arrive? If not, this
+          # merge is a bookkeeping commit: same tree, one new ancestor. There is
+          # nothing for the build to verify or publish that is not already
+          # published, so the dispatch below is skipped.
+          if git diff --quiet "$BASE_SHA" HEAD; then
+            echo "tree_changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing but workflow changes in this merge — the tree is unchanged."
+          else
+            echo "tree_changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # A clean merge is not proof the patch survived. Verify BOTH halves of it
       # are still in the tree before any of this reaches master: the guard
@@ -156,12 +294,16 @@ jobs:
           git push origin HEAD:master
           echo "Pushed $(git rev-parse --short HEAD) to master."
 
-      # Only when master actually moved. An unchanged tree would rebuild to the
-      # same content, and the guard has nothing new to check.
+      # Only when master's TREE actually moved. A merge that carried nothing but
+      # upstream CI changes leaves the tree identical, so it would rebuild to
+      # byte-identical content and the guard would have nothing new to check.
       - name: Ask the build workflow to verify and publish
-        if: steps.ahead.outputs.changed == 'true'
+        if: steps.ahead.outputs.changed == 'true' && steps.quarantine.outputs.tree_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
         run: |
           gh workflow run build-ghcr.yml --ref master
           echo "Dispatched build-ghcr.yml on master."
@@ -192,6 +334,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
         run: |
           CHAIN='["navigationEndpoint"]["browseEndpoint"]["browseId"]'
           LABEL=patch-possibly-obsolete
@@ -271,14 +416,24 @@ jobs:
             echo "Sync run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           } > /tmp/obsolete.md
 
+          # Say it in the summary first — that needs no API and cannot fail.
+          cat /tmp/obsolete.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Then try for an issue. Created WITHOUT --label: see the reporting
+          # step below for why the label is never allowed to gate the issue.
           gh label create "$LABEL" \
             --description "Upstream may have fixed the mixes bug; our patch may be redundant" \
-            --color 0E8A16 2>/dev/null || true
+            --color 0E8A16 >/dev/null 2>&1 || true
 
-          gh issue create \
+          url=$(gh issue create \
             --title "Our mixes patch may be obsolete — upstream appears to have fixed it" \
-            --label "$LABEL" \
-            --body-file /tmp/obsolete.md
+            --body-file /tmp/obsolete.md) || {
+              echo "::warning::Could not open the obsolescence issue — the details are in the job summary."
+              exit 0
+            }
+          echo "Opened $url"
+          gh issue edit "$url" --add-label "$LABEL" \
+            || echo "::warning::Opened $url but could not apply the '$LABEL' label."
 
       - name: Summary
         if: always()
@@ -292,47 +447,92 @@ jobs:
             echo "| master before | \`${{ steps.pre.outputs.base_sha }}\` |"
             echo "| master after | \`$(git rev-parse HEAD)\` |"
             echo "| had changes | ${{ steps.ahead.outputs.changed }} |"
+            echo "| tree changed | ${{ steps.quarantine.outputs.tree_changed }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # One open issue at a time, not one per day. Covers both refusal paths:
-      # a conflicting merge, and a clean merge that lost the patch.
-      - name: Open an issue when the sync is blocked
+          if [ -n "$QUARANTINED" ]; then
+            {
+              echo
+              echo "#### Upstream workflow changes NOT taken"
+              echo
+              echo "\`$PROTECTED_PATH/\` is ours; these upstream edits were reverted before the push."
+              echo "Port any of them by hand if they are worth having."
+              echo
+              echo '```'
+              printf '%s\n' "$QUARANTINED"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+        env:
+          QUARANTINED: ${{ steps.quarantine.outputs.quarantined }}
+
+      # REPORTING. A sync that cannot say why it stopped is worse than one that
+      # stops, so the report goes to three places, cheapest and most reliable
+      # first:
+      #
+      #   1. an ::error:: annotation and the job summary. No API call, no token,
+      #      no repository feature — this cannot fail, so the reason a sync
+      #      stopped is always readable from the run itself.
+      #   2. a comment on the already-open issue, if there is one.
+      #   3. a new issue.
+      #
+      # The label is applied AFTER the issue exists, and its failure is a
+      # warning. `gh issue create --label X` refuses to create the issue at all
+      # when X does not exist — that is how the 2026-08-25 run turned a blocked
+      # sync into a silent one ("could not add label: 'upstream-sync-blocked'
+      # not found"). The label is filing; the issue is the point; the annotation
+      # is the guarantee.
+      #
+      # That label was not, in fact, missing from this repo. `gh` resolves a
+      # fork's base repo to its PARENT, so every unpinned gh call in this file
+      # was talking to iv-org/invidious — where our label does not exist and
+      # where GITHUB_TOKEN may create nothing. Hence GH_REPO on every gh step.
+      # Two other latent bugs came from the same root: `gh workflow run
+      # build-ghcr.yml` would have dispatched against upstream, and this repo
+      # was a fork with Issues disabled (now enabled) so no issue could be
+      # opened regardless. Layer 1 is what makes all of that survivable.
+      - name: Report a blocked sync
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
+          # Read through the environment, never interpolated into the script:
+          # both of these are multi-line, and `[ -n "<multi-line>" ]` spliced
+          # into bash is a syntax error waiting for the day it fires.
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          INTEGRITY: ${{ steps.integrity.outputs.integrity }}
+          UPSTREAM_SHA: ${{ steps.pre.outputs.upstream_sha }}
+          BASE_SHA: ${{ steps.pre.outputs.base_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE_PREFIX: "Upstream sync blocked"
         run: |
-          existing=$(gh issue list --state open --label "$CONFLICT_LABEL" \
-                       --json number --jq '.[0].number' || true)
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body \
-              "Sync still blocked as of $(date -u +%FT%TZ). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            exit 0
-          fi
-
-          gh label create "$CONFLICT_LABEL" \
-            --description "Upstream sync could not be taken automatically" \
-            --color B60205 2>/dev/null || true
-
           {
             echo "The daily sync from \`iv-org/invidious\` could not be applied, so **master was left untouched**."
             echo
             echo "| field | value |"
             echo "| --- | --- |"
-            echo "| upstream | \`${{ steps.pre.outputs.upstream_sha }}\` |"
-            echo "| our master | \`${{ steps.pre.outputs.base_sha }}\` |"
+            echo "| upstream | \`$UPSTREAM_SHA\` |"
+            echo "| our master | \`$BASE_SHA\` |"
             echo
-            if [ -n "${{ steps.merge.outputs.conflicts }}" ]; then
+            if [ -n "$CONFLICTS" ]; then
               echo "**The merge conflicted.** Files needing a human:"
               echo '```'
-              echo "${{ steps.merge.outputs.conflicts }}"
+              printf '%s\n' "$CONFLICTS"
               echo '```'
             fi
-            if [ -n "${{ steps.integrity.outputs.integrity }}" ]; then
+            if [ -n "$INTEGRITY" ]; then
               echo "**Upstream merged cleanly, but our patch did not survive it:**"
               echo '```'
-              echo "${{ steps.integrity.outputs.integrity }}"
+              printf '%s\n' "$INTEGRITY"
               echo '```'
               echo "Upstream has most likely refactored \`fetch_mix\`. Re-apply the guard against the new shape, keep \`spec/invidious/mixes_spec.cr\` passing, then re-run this workflow."
+            fi
+            if [ -z "$CONFLICTS" ] && [ -z "$INTEGRITY" ]; then
+              echo "**The sync failed before it could classify itself.** Neither a merge conflict nor a"
+              echo "lost patch was recorded, so the cause is in the step log of the run linked below —"
+              echo "a failed push, a failed quarantine, or an infrastructure error."
             fi
             echo
             echo "Nothing was force-pushed and no commit was dropped. Resolve locally:"
@@ -343,10 +543,50 @@ jobs:
             echo "git fetch upstream master && git merge upstream/master"
             echo '```'
             echo
-            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "Run: $RUN_URL"
           } > /tmp/issue-body.md
 
-          gh issue create \
-            --title "Upstream sync blocked ($(date -u +%F))" \
-            --label "$CONFLICT_LABEL" \
-            --body-file /tmp/issue-body.md
+          # (1) ALWAYS. No API, no token, no repository feature — cannot fail.
+          {
+            echo "### Sync blocked"
+            echo
+            cat /tmp/issue-body.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Upstream sync blocked — master untouched. Full report in this run's job summary."
+
+          # (2)/(3) BEST EFFORT from here down. Nothing below may mask the above.
+          gh label create "$CONFLICT_LABEL" \
+            --description "Upstream sync could not be taken automatically" \
+            --color B60205 >/dev/null 2>&1 || true
+
+          # Find an already-open report. Prefer the label; fall back to the
+          # title, so a missing label cannot turn one open issue into a new
+          # issue every single morning.
+          existing=$(gh issue list --state open --label "$CONFLICT_LABEL" \
+                       --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$existing" ]; then
+            existing=$(gh issue list --state open --search "$TITLE_PREFIX in:title" \
+                         --json number,title \
+                         --jq "[.[] | select(.title | startswith(\"$TITLE_PREFIX\"))] | .[0].number" \
+                         2>/dev/null || true)
+          fi
+
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --body \
+              "Sync still blocked as of $(date -u +%FT%TZ). Run: $RUN_URL" \
+              || echo "::warning::Could not comment on #$existing — the report is in the job summary."
+            exit 0
+          fi
+
+          # No --label here, deliberately. An issue that exists unlabelled is a
+          # report; an issue that was refused over a label is silence.
+          url=$(gh issue create \
+                  --title "$TITLE_PREFIX ($(date -u +%F))" \
+                  --body-file /tmp/issue-body.md) || {
+            echo "::warning::Could not open an issue (are Issues enabled on this repo?) — the full report is in the job summary above."
+            exit 0
+          }
+          echo "Opened $url"
+
+          gh issue edit "$url" --add-label "$CONFLICT_LABEL" \
+            || echo "::warning::Opened $url but could not apply the '$CONFLICT_LABEL' label."
