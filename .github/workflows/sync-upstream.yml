@@ -301,6 +301,9 @@ jobs:
         if: steps.ahead.outputs.changed == 'true' && steps.quarantine.outputs.tree_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
         run: |
           gh workflow run build-ghcr.yml --ref master
           echo "Dispatched build-ghcr.yml on master."
@@ -331,6 +334,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
         run: |
           CHAIN='["navigationEndpoint"]["browseEndpoint"]["browseId"]'
           LABEL=patch-possibly-obsolete
@@ -472,18 +478,26 @@ jobs:
       #
       # The label is applied AFTER the issue exists, and its failure is a
       # warning. `gh issue create --label X` refuses to create the issue at all
-      # when X does not exist — that is precisely how the 2026-08-25 run turned
-      # a blocked sync into a silent one ("could not add label:
-      # 'upstream-sync-blocked' not found"). The label is filing; the issue is
-      # the point; the annotation is the guarantee.
+      # when X does not exist — that is how the 2026-08-25 run turned a blocked
+      # sync into a silent one ("could not add label: 'upstream-sync-blocked'
+      # not found"). The label is filing; the issue is the point; the annotation
+      # is the guarantee.
       #
-      # Note also that this repo is a fork, and forks are created with Issues
-      # DISABLED. If Issues is ever turned back off, steps 2-3 degrade to a
-      # warning and step 1 still reports.
+      # That label was not, in fact, missing from this repo. `gh` resolves a
+      # fork's base repo to its PARENT, so every unpinned gh call in this file
+      # was talking to iv-org/invidious — where our label does not exist and
+      # where GITHUB_TOKEN may create nothing. Hence GH_REPO on every gh step.
+      # Two other latent bugs came from the same root: `gh workflow run
+      # build-ghcr.yml` would have dispatched against upstream, and this repo
+      # was a fork with Issues disabled (now enabled) so no issue could be
+      # opened regardless. Layer 1 is what makes all of that survivable.
       - name: Report a blocked sync
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
           # Read through the environment, never interpolated into the script:
           # both of these are multi-line, and `[ -n "<multi-line>" ]` spliced
           # into bash is a syntax error waiting for the day it fires.

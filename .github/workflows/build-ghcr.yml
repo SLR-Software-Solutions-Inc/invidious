@@ -160,6 +160,9 @@ jobs:
         if: failure() && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to THIS repo. gh resolves a fork's base repo to its PARENT, so an
+          # unpinned `gh issue create` here targets iv-org/invidious and is refused.
+          GH_REPO: ${{ github.repository }}
           TITLE_PREFIX: "Patch guard failed — image publishing halted"
         run: |
           body="The patch guard failed, so **no image was published**.
